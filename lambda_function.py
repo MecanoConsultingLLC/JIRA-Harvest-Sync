@@ -88,7 +88,7 @@ def jira_request(method, path, body=None):
 
 
 def harvest_request(method, path, body=None):
-    """Make an authenticated Harvest REST API call."""
+    """Make an authenticated Harvest REST API call with retry on transient errors."""
     secrets = get_secrets()
 
     url = f"{HARVEST_BASE_URL}{path}"
@@ -101,18 +101,30 @@ def harvest_request(method, path, body=None):
     }
 
     data = json.dumps(body).encode() if body else None
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    last_error = None
 
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
-        if e.code == 429:
-            logger.warning("Harvest rate limit hit on %s %s", method, path)
+    for attempt in range(3):
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 502, 503):
+                last_error = e
+                wait = 2 ** attempt
+                logger.warning(
+                    "Harvest %s %s -> %d, retrying in %ds (attempt %d/3)",
+                    method, path, e.code, wait, attempt + 1,
+                )
+                time.sleep(wait)
+                continue
+            error_body = e.read().decode() if e.fp else ""
+            logger.error("Harvest %s %s -> %d: %s", method, path, e.code, error_body)
             raise
-        error_body = e.read().decode() if e.fp else ""
-        logger.error("Harvest %s %s -> %d: %s", method, path, e.code, error_body)
-        raise
+
+    # All retries exhausted
+    logger.error("Harvest %s %s failed after 3 attempts", method, path)
+    raise last_error
 
 
 # ---------------------------------------------------------------------------
