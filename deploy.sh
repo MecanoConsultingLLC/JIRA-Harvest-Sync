@@ -185,7 +185,7 @@ if $AWS lambda create-function \
     --handler lambda_function.handler \
     --role "$ROLE_ARN" \
     --zip-file fileb:///tmp/jira-harvest-sync.zip \
-    --timeout 60 \
+    --timeout 300 \
     --memory-size 128 \
     --description "Syncs Jira issues to Harvest tasks every 5 minutes" 2>/dev/null; then
     echo "    Lambda function created."

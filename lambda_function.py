@@ -2,8 +2,10 @@
 Jira-to-Harvest Task Sync Lambda
 
 Every 5 minutes, checks for Jira issues created in the last 24 hours and creates
-matching Harvest tasks. Sends an SES alert if a Jira project has no matching
-Harvest project (rate-limited to once per 24h).
+matching Harvest tasks. Can also be invoked manually with a custom date range.
+
+Scheduled runs: sends an SES alert for unmapped projects (rate-limited to 1/day).
+Manual runs with "since": sends an email summary of all tasks created.
 
 Uses stdlib only (urllib, json, base64) plus boto3 (available in Lambda runtime).
 """
@@ -123,14 +125,22 @@ def get_jira_projects():
     return {p["key"]: p["name"] for p in projects}
 
 
-def get_recent_jira_issues():
-    """POST /rest/api/3/search/jql with created >= -1d, token-based pagination."""
+def get_jira_issues(since=None):
+    """POST /rest/api/3/search/jql, token-based pagination.
+
+    Args:
+        since: Date string for JQL (e.g. "2026-01-01"). Defaults to "-1d".
+    """
+    jql_date = f"'{since}'" if since else "-1d"
+    jql = f"created >= {jql_date} ORDER BY created ASC"
+    logger.info("JQL: %s", jql)
+
     issues = []
     next_page_token = None
 
     while True:
         body = {
-            "jql": "created >= -1d ORDER BY created ASC",
+            "jql": jql,
             "fields": ["summary", "project"],
             "maxResults": 100,
         }
@@ -144,7 +154,7 @@ def get_recent_jira_issues():
         if not next_page_token:
             break
 
-    logger.info("Fetched %d Jira issues created in last 24h", len(issues))
+    logger.info("Fetched %d Jira issues (since %s)", len(issues), jql_date)
     return issues
 
 
@@ -330,13 +340,59 @@ def send_missing_project_alert(missing_projects):
     ssm.put_parameter(Name=param_name, Value=str(time.time()), Overwrite=True)
 
 
+def send_sync_summary_email(created_tasks, missing_projects, since, skipped, errors):
+    """Send SES email summarizing a manual sync run."""
+    sections = []
+
+    if created_tasks:
+        task_lines = "\n".join(f"  - {t}" for t in created_tasks)
+        sections.append(
+            f"Harvest tasks created ({len(created_tasks)}):\n\n{task_lines}"
+        )
+
+    if missing_projects:
+        project_lines = "\n".join(f"  - {p}" for p in sorted(missing_projects))
+        sections.append(
+            f"Unmapped Jira projects ({len(missing_projects)}):\n\n{project_lines}"
+        )
+
+    sections.append(f"Skipped (already existed): {skipped}")
+    if errors:
+        sections.append(f"Errors: {errors}")
+
+    subject = f"Jira-Harvest Sync: {len(created_tasks)} task(s) created (since {since})"
+    body = (
+        f"Manual sync results for Jira issues created since {since}:\n\n"
+        + "\n\n".join(sections)
+        + "\n\nThis is an automated message from the jira-harvest-sync Lambda."
+    )
+
+    ses = boto3.client("ses", region_name="us-east-1")
+    ses.send_email(
+        Source=ALERT_FROM_EMAIL,
+        Destination={"ToAddresses": [ALERT_TO_EMAIL]},
+        Message={
+            "Subject": {"Data": subject},
+            "Body": {"Text": {"Data": body}},
+        },
+    )
+    logger.info("Sent sync summary email (%d created)", len(created_tasks))
+
+
 # ---------------------------------------------------------------------------
 # Lambda handler
 # ---------------------------------------------------------------------------
 
 def handler(event, context):
-    """Orchestrate Jira→Harvest task sync."""
-    logger.info("Starting Jira-Harvest sync")
+    """Orchestrate Jira->Harvest task sync.
+
+    Event payload (all optional):
+        since: Date string (YYYY-MM-DD) to backfill from. Default: last 24h.
+               Example: {"since": "2026-01-01"}
+    """
+    since = event.get("since") if isinstance(event, dict) else None
+    is_manual = since is not None
+    logger.info("Starting Jira-Harvest sync (since=%s, manual=%s)", since, is_manual)
 
     # Load secrets (cached after cold start)
     get_secrets()
@@ -347,10 +403,10 @@ def handler(event, context):
 
     harvest_projects = get_harvest_projects()
 
-    # Fetch recent issues
-    issues = get_recent_jira_issues()
+    # Fetch issues
+    issues = get_jira_issues(since=since)
 
-    created = 0
+    created_tasks = []
     skipped = 0
     errors = 0
     missing_projects = set()
@@ -374,20 +430,29 @@ def handler(event, context):
                 continue
 
             create_harvest_task(project_id, issue_key, summary)
-            created += 1
+            created_tasks.append(f"{issue_key}: {summary}")
 
         except Exception:
             logger.exception("Error processing %s", issue_key)
             errors += 1
 
     summary_msg = (
-        f"Sync complete: {created} created, {skipped} skipped, "
+        f"Sync complete: {len(created_tasks)} created, {skipped} skipped, "
         f"{errors} errors, {len(missing_projects)} unmapped projects"
     )
     logger.info(summary_msg)
 
-    # Send alert if any projects are unmapped
-    if missing_projects:
+    # Email logic
+    if is_manual and created_tasks:
+        # Manual run with tasks created — send detailed summary
+        try:
+            send_sync_summary_email(
+                created_tasks, missing_projects, since, skipped, errors
+            )
+        except Exception:
+            logger.exception("Failed to send sync summary email")
+    elif missing_projects:
+        # Scheduled run — rate-limited unmapped project alert
         try:
             send_missing_project_alert(missing_projects)
         except Exception:
