@@ -1,8 +1,11 @@
 """
 Jira-to-Harvest Task Sync Lambda
 
-Every 5 minutes, checks for Jira issues created in the last 24 hours and creates
-matching Harvest tasks. Can also be invoked manually with a custom date range.
+Three invocation modes:
+  1. Scheduled (EventBridge every 5 min): polls Jira for issues created in last 24h.
+  2. Manual backfill: invoke with {"since": "YYYY-MM-DD"} for a date range.
+  3. Jira webhook (Function URL): receives a POST from Jira when an issue is created,
+     processes that single issue immediately. Secured with X-Webhook-Secret header.
 
 Scheduled runs: sends an SES alert for unmapped projects (rate-limited to 1/day).
 Manual runs with "since": sends an email summary of all tasks created.
@@ -47,6 +50,7 @@ def get_secrets():
         f"{SSM_PREFIX}/jira-api-token",
         f"{SSM_PREFIX}/harvest-account-id",
         f"{SSM_PREFIX}/harvest-api-token",
+        f"{SSM_PREFIX}/webhook-secret",
     ]
     resp = ssm.get_parameters(Names=param_names, WithDecryption=True)
     for p in resp["Parameters"]:
@@ -392,16 +396,108 @@ def send_sync_summary_email(created_tasks, missing_projects, since, skipped, err
 
 
 # ---------------------------------------------------------------------------
+# Webhook handler (Function URL invocations from Jira)
+# ---------------------------------------------------------------------------
+
+def _http_response(status_code, message):
+    """Return a Function URL-compatible HTTP response."""
+    return {
+        "statusCode": status_code,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps({"message": message}),
+    }
+
+
+def handle_webhook(event):
+    """Process a Jira issue-created webhook.
+
+    Jira sends a POST with:
+      - webhookEvent: "jira:issue_created"
+      - issue: { key, fields: { summary, project: { key, name } } }
+    """
+    secrets = get_secrets()
+
+    # --- Validate webhook secret ---
+    headers = event.get("headers", {})
+    provided_secret = headers.get("x-webhook-secret", "")
+    expected_secret = secrets.get("webhook-secret", "")
+
+    if not expected_secret:
+        logger.error("webhook-secret not configured in SSM")
+        return _http_response(500, "Webhook secret not configured")
+
+    if provided_secret != expected_secret:
+        logger.warning("Invalid webhook secret from %s", headers.get("x-forwarded-for", "unknown"))
+        return _http_response(403, "Forbidden")
+
+    # --- Parse body ---
+    raw_body = event.get("body", "")
+    if event.get("isBase64Encoded"):
+        import base64
+        raw_body = base64.b64decode(raw_body).decode()
+
+    try:
+        payload = json.loads(raw_body) if isinstance(raw_body, str) else raw_body
+    except (json.JSONDecodeError, TypeError):
+        logger.error("Invalid JSON body")
+        return _http_response(400, "Invalid JSON")
+
+    webhook_event = payload.get("webhookEvent", "")
+    if webhook_event != "jira:issue_created":
+        logger.info("Ignoring webhook event: %s", webhook_event)
+        return _http_response(200, f"Ignored event: {webhook_event}")
+
+    issue = payload.get("issue")
+    if not issue:
+        logger.error("No issue in webhook payload")
+        return _http_response(400, "Missing issue data")
+
+    issue_key = issue.get("key", "")
+    fields = issue.get("fields", {})
+    summary = fields.get("summary", "")
+    project_info = fields.get("project", {})
+    jira_project_name = project_info.get("name", "")
+
+    logger.info("Webhook: processing %s (%s) from project %s", issue_key, summary, jira_project_name)
+
+    # --- Sync single issue to Harvest ---
+    harvest_projects = get_harvest_projects()
+
+    hp = find_harvest_project(jira_project_name, harvest_projects)
+    if not hp:
+        logger.warning("No Harvest project match for Jira project: %s", jira_project_name)
+        return _http_response(200, f"No Harvest project mapped for: {jira_project_name}")
+
+    project_id = hp["id"]
+
+    if task_exists_in_project(project_id, issue_key):
+        logger.info("Task already exists for %s in Harvest project %d", issue_key, project_id)
+        return _http_response(200, f"Task already exists: {issue_key}")
+
+    create_harvest_task(project_id, issue_key, summary)
+    msg = f"Created Harvest task: {issue_key}: {summary}"
+    logger.info(msg)
+    return _http_response(200, msg)
+
+
+# ---------------------------------------------------------------------------
 # Lambda handler
 # ---------------------------------------------------------------------------
 
 def handler(event, context):
     """Orchestrate Jira->Harvest task sync.
 
-    Event payload (all optional):
-        since: Date string (YYYY-MM-DD) to backfill from. Default: last 24h.
-               Example: {"since": "2026-01-01"}
+    Three invocation modes:
+      1. Function URL (webhook): event has "requestContext" with "http" key
+      2. Manual backfill: event has "since" key
+      3. Scheduled (EventBridge): default — polls Jira for last 24h
     """
+    # --- Mode 1: Jira webhook via Function URL ---
+    if isinstance(event, dict) and "requestContext" in event:
+        logger.info("Invoked via Function URL (webhook)")
+        return handle_webhook(event)
+
+    # --- Mode 2 & 3: Scheduled or manual ---
     since = event.get("since") if isinstance(event, dict) else None
     is_manual = since is not None
     logger.info("Starting Jira-Harvest sync (since=%s, manual=%s)", since, is_manual)
